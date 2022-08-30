@@ -5,8 +5,7 @@
 /// <https://substrate.dev/docs/en/knowledgebase/runtime/frame>
 use codec::{Decode, Encode, MaxEncodedLen};
 use frame_support::traits::{
-    schedule::{DispatchTime, Named},
-    LockIdentifier, Randomness,
+     Randomness,
 };
 
 use sp_runtime::traits::{Dispatchable, Hash, TrailingZeroInput};
@@ -28,14 +27,8 @@ mod tests;
 mod benchmarking;
 
 /// Implementations of some helper traits passed into runtime modules as associated types.
-pub mod connectfour;
-use connectfour::Logic;
-
-const CONNECTFOUR_ID: LockIdentifier = *b"connect4";
-
-/// A type alias for the balance type from this pallet's point of view.
-//type BalanceOf<T> = <T as pallet_balances::Config>::Balance;
-//const MILLICENTS: u32 = 1_000_000_000;
+pub mod gameplay;
+use gameplay::Logic;
 
 #[derive(Encode, Decode, Clone, PartialEq, MaxEncodedLen, TypeInfo)]
 pub enum BoardState<AccountId> {
@@ -58,8 +51,6 @@ pub struct BoardStruct<Hash, AccountId, BlockNumber, BoardState> {
 
 const PLAYER_1: u8 = 1;
 const PLAYER_2: u8 = 2;
-const MAX_BLOCKS_PER_TURN: u8 = 10;
-const CLEANUP_BOARDS_AFTER: u8 = 20;
 
 #[frame_support::pallet]
 pub mod pallet {
@@ -79,20 +70,12 @@ pub mod pallet {
 
         /// The generator used to supply randomness to contracts through `seal_random`.
         type Randomness: Randomness<Self::Hash, Self::BlockNumber>;
-
-        type Scheduler: Named<Self::BlockNumber, Self::Proposal, Self::PalletsOrigin>;
-
-        type PalletsOrigin: From<frame_system::RawOrigin<Self::AccountId>>;
     }
 
     #[pallet::pallet]
     #[pallet::without_storage_info]
     #[pallet::generate_store(pub(super) trait Store)]
     pub struct Pallet<T>(_);
-
-    #[pallet::storage]
-    #[pallet::getter(fn founder_key)]
-    pub type FounderKey<T: Config> = StorageValue<_, Option<T::AccountId>>;
 
     #[pallet::storage]
     #[pallet::getter(fn boards)]
@@ -110,11 +93,6 @@ pub mod pallet {
     /// Store players active board, currently only one board per player allowed.
     pub type PlayerBoard<T: Config> = StorageMap<_, Identity, T::AccountId, T::Hash, ValueQuery>;
 
-    #[pallet::storage]
-    #[pallet::getter(fn board_schedules)]
-    /// Store boards open schedules.
-    pub type BoardSchedules<T: Config> =
-        StorageMap<_, Identity, T::Hash, Option<Vec<u8>>, ValueQuery>;
 
     // Default value for Nonce
     #[pallet::type_value]
@@ -124,28 +102,6 @@ pub mod pallet {
     // Nonce used for generating a different seed each time.
     #[pallet::storage]
     pub type Nonce<T: Config> = StorageValue<_, u64, ValueQuery, NonceDefault<T>>;
-
-    // The genesis config type.
-    #[pallet::genesis_config]
-    pub struct GenesisConfig<T: Config> {
-        pub founder_key: Option<T::AccountId>,
-    }
-
-    // The default value for the genesis config type.
-    #[cfg(feature = "std")]
-    impl<T: Config> Default for GenesisConfig<T> {
-        fn default() -> Self {
-            Self { founder_key: None }
-        }
-    }
-
-    // The build of genesis for the pallet.
-    #[pallet::genesis_build]
-    impl<T: Config> GenesisBuild<T> for GenesisConfig<T> {
-        fn build(&self) {
-            <FounderKey<T>>::put(&self.founder_key);
-        }
-    }
 
     // Pallets use events to inform users when important changes are made.
     // https://substrate.dev/docs/en/knowledgebase/runtime/events
@@ -192,6 +148,7 @@ pub mod pallet {
     // Dispatchable functions must be annotated with a weight and must return a DispatchResult.
     #[pallet::call]
     impl<T: Config> Pallet<T> {
+
         /// Create game for two players
         #[pallet::weight(10_000 + T::DbWeight::get().reads_writes(1,1))]
         pub fn new_game(origin: OriginFor<T>, opponent: T::AccountId) -> DispatchResult {
@@ -265,91 +222,14 @@ pub mod pallet {
             // Check if the last played stone gave us a winner or board is full
             if Logic::evaluate(board.board.clone(), current_player) {
                 board.board_state = BoardState::Finished(Some(current_account));
-            } else if Logic::full(board.board.clone()) {
-                board.board_state = BoardState::Finished(None);
-            }
-
-            // get current blocknumber
-            let last_turn = <frame_system::Pallet<T>>::block_number();
-            board.last_turn = last_turn;
-
-            // Write next board state back into the storage
-            <Boards<T>>::insert(board_id, board);
-
-            // Cancel scheduled task
-            if BoardSchedules::<T>::contains_key(&board_id) {
-                let old_schedule_id = Self::board_schedules(&board_id);
-                if old_schedule_id.is_some() {
-                    // cancel scheduled force end turn
-                    if T::Scheduler::cancel_named(old_schedule_id.unwrap()).is_err() {
-                        frame_support::print("LOGIC ERROR: test_schedule/schedule_named failed");
-                    }
-                }
-            }
-
-            let schedule_id = Self::schedule_end_turn(
-                board_id,
-                last_turn,
-                last_turn + MAX_BLOCKS_PER_TURN.into(),
-            );
-
-            //let bounded_name: BoundedVec<u8, u32> =
-            //	schedule_id.unwrap().clone().try_into().map_err(|_| Error::<T>::BadMetadata)?;
-
-            <BoardSchedules<T>>::insert(board_id, schedule_id);
-
-            Ok(())
-        }
-
-        /// Force end turn after max blocks per turn passed.
-        #[pallet::weight(10_000 + T::DbWeight::get().reads_writes(1,1))]
-        pub fn force_end_turn(
-            origin: OriginFor<T>,
-            board_id: T::Hash,
-            last_turn: T::BlockNumber,
-        ) -> DispatchResult {
-            ensure_root(origin)?;
-
-            // Get board from player.
-            ensure!(Boards::<T>::contains_key(&board_id), "No board found.");
-
-            let mut board = Self::boards(&board_id).unwrap();
-
-            ensure!(
-                board.last_turn == last_turn,
-                "There has been a move in between."
-            );
-
-            if board.board_state == BoardState::Running {
-                if board.next_player == PLAYER_1 {
-                    board.board_state = BoardState::Finished(Some(board.blue.clone()));
-                } else if board.next_player == PLAYER_2 {
-                    board.board_state = BoardState::Finished(Some(board.red.clone()));
-                } else {
-                    return Err(Error::<T>::WrongLogic)?;
-                }
-
-                // get current blocknumber
-                let last_turn = <frame_system::Pallet<T>>::block_number();
-                board.last_turn = last_turn;
-
-                // Write next board state back into the storage
-                <Boards<T>>::insert(board_id, board);
-
-                // Execute cleanup task
-                let schedule_id = Self::schedule_end_turn(
-                    board_id,
-                    last_turn,
-                    last_turn + CLEANUP_BOARDS_AFTER.into(),
-                );
-
-                <BoardSchedules<T>>::insert(board_id, schedule_id);
-            } else {
-                // do cleanup after final force turn.
                 <Boards<T>>::remove(board_id);
                 <PlayerBoard<T>>::remove(board.red);
                 <PlayerBoard<T>>::remove(board.blue);
-                <BoardSchedules<T>>::remove(board_id);
+            } else if Logic::full(board.board.clone()) {
+                board.board_state = BoardState::Finished(None);
+                <Boards<T>>::remove(board_id);
+                <PlayerBoard<T>>::remove(board.red);
+                <PlayerBoard<T>>::remove(board.blue);
             }
 
             Ok(())
@@ -411,35 +291,5 @@ impl<T: Config> Pallet<T> {
         Self::deposit_event(Event::NewBoard(board_id));
 
         return board_id;
-    }
-
-    /// Schedule end turn
-    fn schedule_end_turn(
-        board_id: T::Hash,
-        last_turn: T::BlockNumber,
-        end_turn: T::BlockNumber,
-    ) -> Option<Vec<u8>> {
-        //ensure!(end_turn > <frame_system::Pallet<T>>::block_number(), "Can't schedule a end turn in the past.");
-        let schedule_task_id = (CONNECTFOUR_ID, board_id, last_turn).encode();
-
-        if T::Scheduler::schedule_named(
-            schedule_task_id.clone(),
-            DispatchTime::At(end_turn),
-            None,
-            63,
-            frame_system::RawOrigin::Root.into(),
-            Call::force_end_turn {
-                board_id,
-                last_turn,
-            }
-            .into(),
-        )
-        .is_err()
-        {
-            frame_support::print("LOGIC ERROR: test_schedule/schedule_named failed");
-            return None;
-        }
-
-        Some(schedule_task_id)
     }
 }
