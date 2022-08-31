@@ -2,6 +2,13 @@
 
 The Connect-four module provides functionality for connect four gameplay logic.
 
+## Features
+
+- [x] Connect four gameplay
+- [x] Start random game
+- [ ] Timeouts
+- [ ] Wager matches
+
 ## Overview
 
 The Connect-four module provides functions for:
