@@ -35,10 +35,11 @@ pub struct AwardState {
 	lose: u32,
 }
 
-#[derive(Encode, Decode, Clone, PartialEq, MaxEncodedLen, TypeInfo)]
-pub enum BoardState {
+#[derive(Encode, Decode, Clone, PartialEq, MaxEncodedLen, Debug, TypeInfo)]
+pub enum BoardState<AccountId> {
 	None,
 	Running,
+	Finished(Option<AccountId>),
 }
 
 /// Connect four board structure containing two players and the board
@@ -51,18 +52,16 @@ pub struct BoardStruct<Hash, AccountId, BlockNumber, BoardState> {
 	last_turn: BlockNumber,
 	next_player: u8,
 	board_state: BoardState,
-    award: AwardState
+	award: AwardState,
 }
 
 const PLAYER_1: u8 = 1;
 const PLAYER_2: u8 = 2;
+const ACCEPTED_DIFF: u8 = 10;
 
 #[frame_support::pallet]
 pub mod pallet {
-	use frame_support::{
-		dispatch::DispatchResult,
-		pallet_prelude::*,
-	};
+	use frame_support::{dispatch::DispatchResult, pallet_prelude::*};
 	use frame_system::pallet_prelude::*;
 
 	// important to use outside structs and consts
@@ -88,8 +87,7 @@ pub mod pallet {
 	#[pallet::storage]
 	#[pallet::getter(fn challenges)]
 	/// Store players active board, currently only one board per player allowed.
-	pub type Challenges<T: Config> =
-		StorageMap<_, Identity, T::AccountId, AwardState, OptionQuery>;
+	pub type Challenges<T: Config> = StorageMap<_, Identity, T::AccountId, AwardState, OptionQuery>;
 
 	#[pallet::storage]
 	#[pallet::getter(fn boards)]
@@ -98,20 +96,19 @@ pub mod pallet {
 		_,
 		Identity,
 		T::Hash,
-		BoardStruct<T::Hash, T::AccountId, T::BlockNumber, BoardState>,
+		BoardStruct<T::Hash, T::AccountId, T::BlockNumber, BoardState<T::AccountId>>,
 		OptionQuery,
 	>;
 
-    #[pallet::storage]
+	#[pallet::storage]
 	#[pallet::getter(fn scoring_board)]
 	/// Store all boards that are currently being played.
-	pub type ScoringBoard<T: Config> = StorageMap<
-		_,
-		Identity,
-		T::AccountId,
-		i32,
-		OptionQuery,
-	>;
+	pub type ScoringBoard<T: Config> = StorageMap<_, Identity, T::AccountId, i32, OptionQuery>;
+
+	#[pallet::storage]
+	#[pallet::getter(fn match_queue)]
+	/// Store all boards that are currently being played.
+	pub type MatchQueue<T: Config> = StorageMap<_, Identity, T::AccountId, i32, OptionQuery>;
 
 	#[pallet::storage]
 	#[pallet::getter(fn player_board)]
@@ -132,24 +129,25 @@ pub mod pallet {
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
-		/// A new challenge
-		NewChallenge(T::AccountId, T::AccountId, AwardState),
-
+		/// Accept challenge
+		AcceptChallenge(T::AccountId, T::AccountId, AwardState),
+		/// Reject challenge
+		RejectChallenge(T::AccountId, T::AccountId, AwardState),
+		/// Cancel challenge
+		CancelChallenge(T::AccountId),
+		/// Cancel challenge
+		CancelQueue(T::AccountId),
 		/// A new board got created.
 		NewBoard(T::Hash),
+		/// Current state of the game.
+		GameState(BoardStruct<T::Hash, T::AccountId, T::BlockNumber, BoardState<T::AccountId>>),
 	}
 
 	// Errors inform users that something went wrong.
 	#[pallet::error]
 	pub enum Error<T> {
-		/// Error names should be descriptive.
-		NoneValue,
-		/// Errors should have helpful documentation associated with them.
-		StorageOverflow,
-		/// Something went wrong during generating
-		BadMetadata,
-		/// Couldn't put off a scheduler task as planned.
-		ScheduleError,
+		/// Can't find element to remove
+		NotFound,
 		/// Player already has a board which is being played.
 		PlayerBoardExists,
 		/// Player board doesn't exist for this player.
@@ -164,10 +162,12 @@ pub mod pallet {
 		AlreadyQueued,
 		/// Extrinsic is limited to founder.
 		OnlyFounderAllowed,
-        /// Challenger shouldn't respond to challenge and challenger shouldn't challenge challenger
-        WrongChallengeTurn,
-        /// Challenger shouldn't re-challenge, cancel old challenge first
-        ReChallengeError
+		/// Challenger shouldn't respond to challenge and challenger shouldn't challenge challenger
+		WrongChallengeTurn,
+		/// Challenger shouldn't re-challenge, cancel old challenge first
+		ReChallengeError,
+		/// Failed to access match queue
+		MatchQueueError,
 	}
 
 	// Dispatchable functions allows users to interact with the pallet and invoke state changes.
@@ -175,70 +175,125 @@ pub mod pallet {
 	// Dispatchable functions must be annotated with a weight and must return a DispatchResult.
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
+		/// Find randome game
+		#[pallet::weight(10_000 + T::DbWeight::get().reads_writes(1,1))]
+		pub fn find_game(origin: OriginFor<T>) -> DispatchResult {
+			let sender = ensure_signed(origin)?;
+
+			// Make sure players have no board open.
+			ensure!(!PlayerBoard::<T>::contains_key(&sender), Error::<T>::PlayerBoardExists);
+			// Make sure not a challenger
+			ensure!(!<Challenges<T>>::contains_key(&sender), Error::<T>::ReChallengeError);
+			// Make sure gamer is not available
+			ensure!(!<MatchQueue<T>>::contains_key(&sender), Error::<T>::MatchQueueError);
+
+			let finder_score = match <ScoringBoard<T>>::get(&sender) {
+				Some(val) => val,
+				None => 0,
+			};
+
+			for (account_id, score) in <MatchQueue<T>>::iter() {
+				let opponent = account_id;
+				if i32::abs(score - finder_score) as u8 <= ACCEPTED_DIFF {
+					let award = AwardState { win: 10, lose: 5 };
+
+					<MatchQueue<T>>::remove(opponent.clone());
+					<MatchQueue<T>>::remove(sender.clone());
+					let _board_id = Self::create_game(sender.clone(), opponent, award);
+					break;
+				}
+			}
+			<MatchQueue<T>>::insert(sender, finder_score);
+			Ok(())
+		}
+
+		/// Cancel Challenge
+		#[pallet::weight(10_000 + T::DbWeight::get().reads_writes(1,1))]
+		pub fn cancel_queue(origin: OriginFor<T>) -> DispatchResult {
+			let sender = ensure_signed(origin)?;
+
+			// Make sure players have no board open.
+			ensure!(!PlayerBoard::<T>::contains_key(&sender), Error::<T>::PlayerBoardExists);
+			// Make sure challenger in the storage
+			ensure!(<MatchQueue<T>>::contains_key(&sender), Error::<T>::NotFound);
+
+			<MatchQueue<T>>::remove(sender.clone());
+			Self::deposit_event(Event::CancelQueue(sender));
+			Ok(())
+		}
+
 		/// Challenge player
 		#[pallet::weight(10_000 + T::DbWeight::get().reads_writes(1,1))]
-		pub fn challenge(origin: OriginFor<T>, opponent: T::AccountId, win: u32, lose: u32) -> DispatchResult {
-            let sender = ensure_signed(origin)?;
-            // Don't allow playing against yourself.
+		pub fn challenge(
+			origin: OriginFor<T>,
+			opponent: T::AccountId,
+			win: u32,
+			lose: u32,
+		) -> DispatchResult {
+			let sender = ensure_signed(origin)?;
+			// Don't allow playing against yourself.
 			ensure!(sender != opponent, Error::<T>::NoFakePlay);
 
-            // Make sure players have no board open.
+			// Make sure players have no board open.
 			ensure!(!PlayerBoard::<T>::contains_key(&sender), Error::<T>::PlayerBoardExists);
 			ensure!(!PlayerBoard::<T>::contains_key(&opponent), Error::<T>::PlayerBoardExists);
 
-            // Make sure responder is not also a challenger
-            ensure!(!<Challenges<T>>::contains_key(&opponent), Error::<T>::WrongChallengeTurn);
-            // Make sure challenger doesn't re-challenge
-            ensure!(!<Challenges<T>>::contains_key(&sender), Error::<T>::ReChallengeError);
+			// Make sure responder is not also a challenger
+			ensure!(!<Challenges<T>>::contains_key(&opponent), Error::<T>::WrongChallengeTurn);
+			// Make sure challenger doesn't re-challenge
+			ensure!(!<Challenges<T>>::contains_key(&sender), Error::<T>::ReChallengeError);
 
-            let challenge_state = AwardState {
-                win,
-                lose,
-            };
+			let challenge_state = AwardState { win, lose };
 
-            <Challenges<T>>::insert(sender.clone(), challenge_state.clone());
-            Self::deposit_event(Event::NewChallenge(sender, opponent, challenge_state));
+			<Challenges<T>>::insert(sender.clone(), challenge_state.clone());
+			Self::deposit_event(Event::AcceptChallenge(sender, opponent, challenge_state));
 			Ok(())
 		}
 
 		/// Response hallenge player
 		#[pallet::weight(10_000 + T::DbWeight::get().reads_writes(1,1))]
-		pub fn resp_challenge(origin: OriginFor<T>, opponent: T::AccountId, accepted: bool) -> DispatchResult {
-            let sender = ensure_signed(origin)?;
-            // Don't allow playing against yourself.
+		pub fn resp_challenge(
+			origin: OriginFor<T>,
+			opponent: T::AccountId,
+			accepted: bool,
+		) -> DispatchResult {
+			let sender = ensure_signed(origin)?;
+			// Don't allow playing against yourself.
 			ensure!(sender != opponent, Error::<T>::NoFakePlay);
 
-            // Make sure players have no board open.
+			// Make sure players have no board open.
 			ensure!(!PlayerBoard::<T>::contains_key(&sender), Error::<T>::PlayerBoardExists);
 			ensure!(!PlayerBoard::<T>::contains_key(&opponent), Error::<T>::PlayerBoardExists);
 
-            // Make sure responder is not also a challenger
-            ensure!(!<Challenges<T>>::contains_key(&sender), Error::<T>::WrongChallengeTurn);
+			// Make sure responder is not also a challenger
+			ensure!(!<Challenges<T>>::contains_key(&sender), Error::<T>::WrongChallengeTurn);
 
-            let award = Self::challenges(opponent.clone()).unwrap();
+			let award = Self::challenges(opponent.clone()).unwrap();
 
-            if accepted {
-                // Create new game
-			    let _board_id = Self::create_game(sender.clone(), opponent, award);
-            } else {
-                // Remove challenge
-                <Challenges<T>>::remove(opponent);
-            }
+			if accepted {
+				// Create new game
+				let _board_id = Self::create_game(sender, opponent.clone(), award);
+			} else {
+				// Remove challenge
+				Self::deposit_event(Event::RejectChallenge(sender, opponent.clone(), award));
+			}
+			<Challenges<T>>::remove(opponent);
 
 			Ok(())
 		}
 
-        /// Cancel Challenge
+		/// Cancel Challenge
 		#[pallet::weight(10_000 + T::DbWeight::get().reads_writes(1,1))]
 		pub fn cancel_challenge(origin: OriginFor<T>) -> DispatchResult {
-            let sender = ensure_signed(origin)?;
+			let sender = ensure_signed(origin)?;
 
-            // Make sure players have no board open.
+			// Make sure players have no board open.
 			ensure!(!PlayerBoard::<T>::contains_key(&sender), Error::<T>::PlayerBoardExists);
-            // Make sure challenger in the storage
-            ensure!(<Challenges<T>>::contains_key(&sender), Error::<T>::ReChallengeError);
+			// Make sure challenger in the storage
+			ensure!(<Challenges<T>>::contains_key(&sender), Error::<T>::NotFound);
 
-            <Challenges<T>>::remove(sender.clone());
+			<Challenges<T>>::remove(sender.clone());
+			Self::deposit_event(Event::CancelChallenge(sender));
 			Ok(())
 		}
 
@@ -265,16 +320,16 @@ pub mod pallet {
 
 			let current_player = board.next_player;
 			let current_account;
-            let last_account;
+			let last_account;
 
 			// Check if correct player is at turn
 			if current_player == PLAYER_1 {
 				current_account = board.red.clone();
-                last_account = board.blue.clone();
+				last_account = board.blue.clone();
 				board.next_player = PLAYER_2;
 			} else if current_player == PLAYER_2 {
 				current_account = board.blue.clone();
-                last_account = board.red.clone();
+				last_account = board.red.clone();
 				board.next_player = PLAYER_1;
 			} else {
 				return Err(Error::<T>::WrongLogic)?;
@@ -288,53 +343,55 @@ pub mod pallet {
 				return Err(Error::<T>::WrongLogic)?;
 			}
 
-            let red = board.red.clone();
-            let blue = board.blue.clone();
-            let win_award = board.award.win;
-            let lose_award = board.award.lose;
+			let red = board.red.clone();
+			let blue = board.blue.clone();
+			let win_award = board.award.win;
+			let lose_award = board.award.lose;
 
 			// Check if the last played stone gave us a winner or board is full
 			if Logic::evaluate(board.board.clone(), current_player) {
+				match <ScoringBoard<T>>::try_get(&current_account) {
+					Ok(score) => {
+						let new_score = score + win_award as i32;
+						<ScoringBoard<T>>::mutate(&current_account, |score| {
+							*score = Some(new_score);
+						});
+					},
+					Err(_e) => {
+						<ScoringBoard<T>>::insert(&current_account, win_award as i32);
+					},
+				};
 
-                match <ScoringBoard<T>>::try_get(&current_account) {
-                    Ok(score) => {
-                        let new_score = score + win_award as i32;
-                        <ScoringBoard<T>>::mutate(&current_account, |score| {
-                            *score = Some(new_score);
-                        });
-                    },
-                    Err(_e) => {
-                        <ScoringBoard<T>>::insert(&current_account, win_award as i32);
-                    }
-                };
-
-                match <ScoringBoard<T>>::try_get(&last_account) {
-                    Ok(score) => {
-                        let new_score = score - lose_award as i32;
-                        <ScoringBoard<T>>::mutate(&last_account, |score| {
-                            *score = Some(new_score);
-                        });
-                    },
-                    Err(_e) => {
-                        <ScoringBoard<T>>::insert(&last_account, 0 - lose_award as i32);
-                    }
-                };
+				match <ScoringBoard<T>>::try_get(&last_account) {
+					Ok(score) => {
+						let new_score = score - lose_award as i32;
+						<ScoringBoard<T>>::mutate(&last_account, |score| {
+							*score = Some(new_score);
+						});
+					},
+					Err(_e) => {
+						<ScoringBoard<T>>::insert(&last_account, 0 - lose_award as i32);
+					},
+				};
+				board.board_state = BoardState::Finished(Some(current_account));
+				Self::deposit_event(Event::GameState(board));
 				<Boards<T>>::remove(board_id);
 				<PlayerBoard<T>>::remove(red);
 				<PlayerBoard<T>>::remove(blue);
 			} else if Logic::full(board.board.clone()) {
+				board.board_state = BoardState::Finished(None);
+				Self::deposit_event(Event::GameState(board));
 				<Boards<T>>::remove(board_id);
 				<PlayerBoard<T>>::remove(red);
 				<PlayerBoard<T>>::remove(blue);
 			} else {
-                // get current blocknumber
-                let last_turn = <frame_system::Pallet<T>>::block_number();
-                board.last_turn = last_turn;
-            }
-            
-
-            // Write next board state back into the storage
-            <Boards<T>>::insert(board_id, board);
+				// get current blocknumber
+				let last_turn = <frame_system::Pallet<T>>::block_number();
+				board.last_turn = last_turn;
+				// Write next board state back into the storage
+				<Boards<T>>::insert(board_id, board.clone());
+				Self::deposit_event(Event::GameState(board));
+			}
 
 			Ok(())
 		}
@@ -377,7 +434,7 @@ impl<T: Config> Pallet<T> {
 			last_turn: block_number,
 			next_player,
 			board_state: BoardState::Running,
-            award
+			award,
 		};
 
 		// insert the new board into the storage
